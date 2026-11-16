@@ -1,0 +1,74 @@
+# Road perception model: A-YOLOM(s) cut down to two tasks (Step 6 of the build roadmap)
+#   - detection: 17 classes (see datasets/lanedet.yaml for the class list)
+#   - lane segmentation: 3 classes per pixel (background, solid, dashed) - Step 7
+# Changes from yolov8-bdd-v4-one-dropout-individual-s.yaml:
+#   - removed the drivable-area neck (old layers 34-45) and its Segment head (old layer 47)
+#   - Detect head: 1 -> 17 classes
+#   - lane Segment head: 2 -> 3 output channels (Step 7)
+# Layer numbers 0-33 are identical to the original, so pretrained weights for the backbone,
+# detection neck and lane neck load directly. Heads move: Detect 46 -> 34, lane Segment 48 -> 35
+# (step6_check.py remaps those when transferring weights).
+
+tnc: 19  # total names across tasks: 17 detection classes + 2 lane classes
+
+scales: # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+scale: s
+
+# Shared backbone (unchanged)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
+  - [-1, 3, C2f, [128, True]]  # 2 (P2 features, 160x160 at 640 input)
+  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
+  - [-1, 6, C2f, [256, True]]  # 4
+  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 6, C2f, [512, True]]  # 6
+  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 3, C2f, [1024, True]]  # 8
+  - [-1, 1, SPPF, [1024, 5]]  # 9
+
+head:
+  # Detection neck (PAN/FPN, plain concatenation) - unchanged
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 10
+  - [[-1, 6], 1, Concat, [1]]  # 11 cat backbone P4
+  - [-1, 3, C2f, [512]]  # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 13
+  - [[-1, 4], 1, Concat, [1]]  # 14 cat backbone P3
+  - [-1, 3, C2f, [256]]  # 15 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]  # 16
+  - [[-1, 12], 1, Concat, [1]]  # 17 cat head P4
+  - [-1, 3, C2f, [512]]  # 18 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]  # 19
+  - [[-1, 9], 1, Concat, [1]]  # 20 cat head P5
+  - [-1, 3, C2f, [1024]]  # 21 (P5/32-large)
+
+  # Lane neck (adaptive concatenation) - unchanged
+  - [9, 1, nn.Upsample, [None, 2, 'nearest']]  # 22
+  - [[-1, 6], 1, Concat_dropout, [1]]  # 23 cat backbone P4
+  - [-1, 3, C2f, [512]]  # 24  (40x40 - planned self-attention site, Step 9)
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 25
+  - [[-1, 4], 1, Concat_dropout, [1]]  # 26 cat backbone P3
+  - [-1, 3, C2f, [256]]  # 27
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 28
+  - [[-1, 2], 1, Concat_dropout, [1]]  # 29 cat backbone P2
+  - [-1, 3, C2f, [128]]  # 30
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]  # 31
+  - [[-1, 0], 1, Concat_dropout, [1]]  # 32 cat backbone P1
+  - [-1, 3, C2f, [64]]  # 33
+
+  # Task heads - order must match labels_list in the data yaml (detection first, then lane)
+  - [[15, 18, 21], 1, Detect, [17]]  # 34 Detect(P3, P4, P5), 17 classes
+  - [[33], 1, Segment, [2, 32, 256]]  # 35 lane Segment: nc=2 -> 3 output channels (background, solid, dashed)

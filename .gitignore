@@ -1,0 +1,33 @@
+# --- Python build / install output ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Weights and training output (large, regenerable) ---
+/weights/
+*.pt
+*.onnx
+*.engine
+/runs/
+
+# --- Datasets: keep them outside the repo (e.g. C:\datasets\) ---
+/bdd100k/
+/bdd10k/
+/datasets_local/
+/labels/
+/step7_synthetic*/
+/step7_diag*/
+*.cache
+
+# --- One-off files ---
+*.zip
+/inspect_*.txt
+/step*_check.txt
+/lanes_solid_vs_dashed.jpg
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
