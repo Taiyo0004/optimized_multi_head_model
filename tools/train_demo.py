@@ -29,7 +29,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default='datasets_local/bdd_demo/lanedet_data.yaml')
     ap.add_argument('--weights', default='weights/lanedet_s_init.pt')
-    ap.add_argument('--epochs', type=int, default=20)
+    ap.add_argument('--epochs', type=int, default=14)
     ap.add_argument('--batch', type=int, default=4)
     ap.add_argument('--imgsz', type=int, default=640)
     ap.add_argument('--name', default='demo')

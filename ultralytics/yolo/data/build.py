@@ -62,6 +62,44 @@ class _RepeatSampler:
             yield from iter(self.sampler)
 
 
+class ResumableRandomSampler(torch.utils.data.Sampler):
+    """lanedet: shuffling sampler whose order depends only on (seed, epoch), so training can resume mid-epoch.
+
+    Each call to __iter__ starts the next epoch (the infinite loader calls it once per epoch, possibly a few
+    batches early because of worker prefetch). set_position(epoch, skip) makes the next __iter__ produce the
+    order of `epoch` with its first `skip` samples left out.
+    """
+
+    def __init__(self, data_source, seed=0):
+        self.n = len(data_source)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.skip = 0
+
+    def set_position(self, epoch, skip=0):
+        self.epoch, self.skip = int(epoch), int(skip)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed * 100003 + self.epoch)
+        order = torch.randperm(self.n, generator=g).tolist()[self.skip:]
+        self.epoch, self.skip = self.epoch + 1, 0
+        return iter(order)
+
+    def __len__(self):
+        return self.n  # always the full epoch, so len(loader) stays the number of batches per epoch
+
+
+def set_loader_position(loader, epoch, skip_batches=0):
+    """lanedet: point a training loader at `epoch`, skipping its first `skip_batches` batches. Returns True if done."""
+    sampler = getattr(getattr(getattr(loader, 'batch_sampler', None), 'sampler', None), 'sampler', None)
+    if not isinstance(sampler, ResumableRandomSampler):
+        return False
+    sampler.set_position(epoch, skip_batches * loader.batch_size)
+    loader.reset()  # rebuild the iterator so nothing prefetched from the old position is used
+    return True
+
+
 def seed_worker(worker_id):  # noqa
     # Set dataloader worker seed https://pytorch.org/docs/stable/notes/randomness.html#dataloader
     worker_seed = torch.initial_seed() % 2 ** 32
@@ -90,12 +128,14 @@ def build_yolo_dataset(cfg, img_path, batch, data_info, mode='train', rect=False
         data=data_info)
 
 
-def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1, collate_fn=None):
+def build_dataloader(dataset, batch, workers, shuffle=True, rank=-1, collate_fn=None, seed=0):
     """Return an InfiniteDataLoader or DataLoader for training or validation set."""
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch if batch > 1 else 0, workers])  # number of workers
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
+    if sampler is None and shuffle:  # lanedet: single-GPU training uses a resumable shuffle order
+        sampler, shuffle = ResumableRandomSampler(dataset, seed), False
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
     if collate_fn==None:

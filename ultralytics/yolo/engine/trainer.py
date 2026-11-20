@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from ultralytics.nn.tasks import attempt_load_one_weight, attempt_load_weights
 from ultralytics.yolo.cfg import get_cfg
+from ultralytics.yolo.data.build import set_loader_position
 from ultralytics.yolo.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.yolo.utils import (DEFAULT_CFG, LOGGER, ONLINE, RANK, ROOT, SETTINGS, TQDM_BAR_FORMAT, __version__,
                                     callbacks, clean_url, colorstr, emojis, yaml_save)
@@ -107,6 +108,8 @@ class BaseTrainer:
         self.batch_size = self.args.batch
         self.epochs = self.args.epochs
         self.start_epoch = 0
+        self.start_iter = 0  # lanedet: first batch of start_epoch (>0 when resuming a mid-epoch checkpoint)
+        self.resume_state = {}  # lanedet: extra state restored from a mid-epoch checkpoint
         if RANK == -1:
             print_args(vars(self.args))
 
@@ -281,7 +284,11 @@ class BaseTrainer:
                 if self.args.plots and not self.args.v5loader:
                     self.plot_training_labels()
         self.resume_training(ckpt)
-        self.scheduler.last_epoch = self.start_epoch - 1  # do not move
+        # lanedet: during epoch e the scheduler must sit at e (LambdaLR's own init step leaves it at 0 for epoch 0);
+        # upstream used start_epoch - 1, which made a resumed run's learning rate lag by one epoch
+        self.scheduler.last_epoch = self.start_epoch  # do not move
+        if RANK == -1 and (self.start_epoch or self.start_iter):
+            set_loader_position(self.train_loader, self.start_epoch, self.start_iter)
         self.run_callbacks('on_pretrain_routine_end')
 
     def _do_train(self, world_size=1):
@@ -296,7 +303,11 @@ class BaseTrainer:
         self.train_time_start = time.time()
         nb = len(self.train_loader)  # number of batches
         nw = max(round(self.args.warmup_epochs * nb), 100)  # number of warmup iterations
-        last_opt_step = -1
+        last_opt_step = self.resume_state.get('last_opt_step', -1)
+        if self.resume_state.get('scaler') and self.amp:
+            self.scaler.load_state_dict(self.resume_state['scaler'])
+        ckpt_every = 60 * float(getattr(self.args, 'ckpt_minutes', 0) or 0)  # lanedet: seconds between mid-epoch saves
+        last_ckpt_time = time.time()
         self.run_callbacks('on_train_start')
         LOGGER.info(f'Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n'
                     f'Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n'
@@ -312,7 +323,9 @@ class BaseTrainer:
             self.model.train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
-            pbar = enumerate(self.train_loader)
+            # lanedet: a resumed mid-epoch run starts this epoch at batch start_iter
+            i0 = self.start_iter if epoch == self.start_epoch else 0
+            pbar = enumerate(itertools.islice(self.train_loader, nb - i0), start=i0)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
                 LOGGER.info('Closing dataloader mosaic')
@@ -327,108 +340,128 @@ class BaseTrainer:
                 ######Jiayuan
                 # pbar = tqdm(enumerate(self.train_loader), total=nb, bar_format=TQDM_BAR_FORMAT)
                 # ncols will control the width for tqdm. it should be larger than original. Otherwise, it can not display fully.
-                pbar = tqdm(enumerate(self.train_loader), total=nb, ncols=300, bar_format=TQDM_BAR_FORMAT)
+                pbar = tqdm(enumerate(itertools.islice(self.train_loader, nb - i0), start=i0),
+                            total=nb, initial=i0, ncols=300, bar_format=TQDM_BAR_FORMAT)
                 ######
             self.tloss = None
+            if i0 and self.resume_state.get('subloss') is not None:
+                self.subloss = [None if t is None else t.to(self.device) for t in self.resume_state['subloss']]
             self.optimizer.zero_grad()
-            for i, batch in pbar:
-                self.run_callbacks('on_train_batch_start')
-                ######Jiayuan switch the seg labels
-                # for count, map in enumerate(self.data['map']):
-                #     if map!='None':
-                #         replacement_dict_float = {float(key): float(value) for key, value in map.items()}
-                #         for key, value in replacement_dict_float.items():
-                #             replacement_tensor = torch.full_like(batch[count]['cls'], value)
-                #             batch[count]['cls'] = torch.where(batch[count]['cls'] == key, replacement_tensor, batch[count]['cls'])
-                #######
-                # Warmup
-                ni = i + nb * epoch
-                if ni <= nw:
-                    xi = [0, nw]  # x interp
-                    self.accumulate = max(1, np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round())
-                    for j, x in enumerate(self.optimizer.param_groups):
-                        # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                        x['lr'] = np.interp(
-                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x['initial_lr'] * self.lf(epoch)])
-                        if 'momentum' in x:
-                            x['momentum'] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+            done_iter = i0 - 1  # lanedet: last batch fully processed in this epoch
+            try:
+                for i, batch in pbar:
+                    self.run_callbacks('on_train_batch_start')
+                    ######Jiayuan switch the seg labels
+                    # for count, map in enumerate(self.data['map']):
+                    #     if map!='None':
+                    #         replacement_dict_float = {float(key): float(value) for key, value in map.items()}
+                    #         for key, value in replacement_dict_float.items():
+                    #             replacement_tensor = torch.full_like(batch[count]['cls'], value)
+                    #             batch[count]['cls'] = torch.where(batch[count]['cls'] == key, replacement_tensor, batch[count]['cls'])
+                    #######
+                    # Warmup
+                    ni = i + nb * epoch
+                    if ni <= nw:
+                        xi = [0, nw]  # x interp
+                        self.accumulate = max(1, np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round())
+                        for j, x in enumerate(self.optimizer.param_groups):
+                            # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                            x['lr'] = np.interp(
+                                ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x['initial_lr'] * self.lf(epoch)])
+                            if 'momentum' in x:
+                                x['momentum'] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
 
-                # Forward
-                with torch.autocast('cuda', enabled=bool(self.amp)):  # lanedet: torch.cuda.amp is deprecated
-                    batch = self.preprocess_batch(batch)
-                    self.mul_loss = [None for _ in range(len(batch))]
-                    self.mul_loss_items = [None for _ in range(len(batch))]
-                    ######Jiayuan
-                    if self.args.task == "multi":
-                        preds = self.model(batch[0]['img'])
-                        for count in range(len(batch)):
-                            self.mul_loss[count], self.mul_loss_items[count] = self.criterion(preds[count], batch[count], self.data['labels_list'][count],count)
+                    # Forward
+                    with torch.autocast('cuda', enabled=bool(self.amp)):  # lanedet: torch.cuda.amp is deprecated
+                        batch = self.preprocess_batch(batch)
+                        self.mul_loss = [None for _ in range(len(batch))]
+                        self.mul_loss_items = [None for _ in range(len(batch))]
+                        ######Jiayuan
+                        if self.args.task == "multi":
+                            preds = self.model(batch[0]['img'])
+                            for count in range(len(batch)):
+                                self.mul_loss[count], self.mul_loss_items[count] = self.criterion(preds[count], batch[count], self.data['labels_list'][count],count)
+                                if RANK != -1:
+                                    self.mul_loss[count] *= world_size
+                                self.subloss[count] = (self.subloss[count] * i + self.mul_loss_items[count]) / (i + 1) if self.subloss[count] is not None \
+                                    else self.mul_loss_items[count]
+                            self.loss = sum(self.mul_loss)
+                            self.tloss = self.subloss
+                        else:
+                            preds = self.model(batch['img'])
+                            self.loss, self.loss_items = self.criterion(preds, batch)
                             if RANK != -1:
-                                self.mul_loss[count] *= world_size
-                            self.subloss[count] = (self.subloss[count] * i + self.mul_loss_items[count]) / (i + 1) if self.subloss[count] is not None \
-                                else self.mul_loss_items[count]
-                        self.loss = sum(self.mul_loss)
-                        self.tloss = self.subloss
-                    else:
-                        preds = self.model(batch['img'])
-                        self.loss, self.loss_items = self.criterion(preds, batch)
-                        if RANK != -1:
-                            self.loss *= world_size
-                        self.tloss = (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None \
-                            else self.loss_items
+                                self.loss *= world_size
+                            self.tloss = (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None \
+                                else self.loss_items
+                        ######
+
+                    # Backward
+                    # self.scaler.scale(self.loss).backward(retain_graph=True)
+                    # for name, param in self.model.named_parameters():
+                    #     if param.grad is None:
+                    #         print(f"Parameter '{name}' does not have a gradient.")
+
+                    self.scaler.scale(self.loss).backward(retain_graph=False)  ######Jiayuan retain_graph=False Free the GPU memory,
+                    ###### Due to we just use backward once, so we can safely set the retain_graph=False
+
+                    # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+                    if ni - last_opt_step >= self.accumulate:
+                        self.optimizer_step()
+                        last_opt_step = ni
+                    self.loss = self.loss.detach()  ######Jiayuan Free the GPU memory
+                    torch.cuda.empty_cache()
+
+                    # Log
+                    ######Jiayuan
+                    if self.args.task == 'multi':
+                        mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                        losses = [loss_withdraw for loss_withdraw in self.tloss]
+                        loss_values = list(itertools.chain(*[l.tolist() for l in losses]))
+                        loss_len = len(loss_values)
+                        batch_cls = 0
+                        for count in batch:
+                            batch_cls += count['cls'].shape[0]
+                        if RANK in (-1, 0):
+                            pbar.set_description(
+                                ('%11s' * 2 + '%11.4g' * (2 + loss_len)) %
+                                (f'{epoch + 1}/{self.epochs}', mem, *loss_values, batch_cls, batch[0]['img'].shape[-1]))
+                            self.run_callbacks('on_batch_end')
+                            if self.args.plots and ni in self.plot_idx:
+                                for count in range(len(self.tloss)):
+                                    self.plot_training_samples(batch[count], ni, count)
+
+                        self.run_callbacks('on_train_batch_end')
                     ######
+                    else:
+                        mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                        loss_len = self.tloss.shape[0] if len(self.tloss.size()) else 1
+                        losses = self.tloss if loss_len > 1 else torch.unsqueeze(self.tloss, 0)
+                        if RANK in (-1, 0):
+                            pbar.set_description(
+                                ('%11s' * 2 + '%11.4g' * (2 + loss_len)) %
+                                (f'{epoch + 1}/{self.epochs}', mem, *losses, batch['cls'].shape[0], batch['img'].shape[-1]))
+                            self.run_callbacks('on_batch_end')
+                            if self.args.plots and ni in self.plot_idx:
+                                self.plot_training_samples(batch, ni)
 
-                # Backward
-                # self.scaler.scale(self.loss).backward(retain_graph=True)
-                # for name, param in self.model.named_parameters():
-                #     if param.grad is None:
-                #         print(f"Parameter '{name}' does not have a gradient.")
+                        self.run_callbacks('on_train_batch_end')
 
-                self.scaler.scale(self.loss).backward(retain_graph=False)  ######Jiayuan retain_graph=False Free the GPU memory,
-                ###### Due to we just use backward once, so we can safely set the retain_graph=False
-
-                # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-                if ni - last_opt_step >= self.accumulate:
-                    self.optimizer_step()
-                    last_opt_step = ni
-                self.loss = self.loss.detach()  ######Jiayuan Free the GPU memory
-                torch.cuda.empty_cache()
-
-                # Log
-                ######Jiayuan
-                if self.args.task == 'multi':
-                    mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                    losses = [loss_withdraw for loss_withdraw in self.tloss]
-                    loss_values = list(itertools.chain(*[l.tolist() for l in losses]))
-                    loss_len = len(loss_values)
-                    batch_cls = 0
-                    for count in batch:
-                        batch_cls += count['cls'].shape[0]
-                    if RANK in (-1, 0):
-                        pbar.set_description(
-                            ('%11s' * 2 + '%11.4g' * (2 + loss_len)) %
-                            (f'{epoch + 1}/{self.epochs}', mem, *loss_values, batch_cls, batch[0]['img'].shape[-1]))
-                        self.run_callbacks('on_batch_end')
-                        if self.args.plots and ni in self.plot_idx:
-                            for count in range(len(self.tloss)):
-                                self.plot_training_samples(batch[count], ni, count)
-
-                    self.run_callbacks('on_train_batch_end')
-                ######
-                else:
-                    mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                    loss_len = self.tloss.shape[0] if len(self.tloss.size()) else 1
-                    losses = self.tloss if loss_len > 1 else torch.unsqueeze(self.tloss, 0)
-                    if RANK in (-1, 0):
-                        pbar.set_description(
-                            ('%11s' * 2 + '%11.4g' * (2 + loss_len)) %
-                            (f'{epoch + 1}/{self.epochs}', mem, *losses, batch['cls'].shape[0], batch['img'].shape[-1]))
-                        self.run_callbacks('on_batch_end')
-                        if self.args.plots and ni in self.plot_idx:
-                            self.plot_training_samples(batch, ni)
-
-                    self.run_callbacks('on_train_batch_end')
+                    done_iter = i
+                    # lanedet: mid-epoch checkpoint, taken right after an optimizer step so no gradients are lost
+                    if (RANK in (-1, 0) and ckpt_every and ni == last_opt_step and i + 1 < nb
+                            and time.time() - last_ckpt_time >= ckpt_every):
+                        self.save_checkpoint(epoch, i, last_opt_step)
+                        last_ckpt_time = time.time()
+            except KeyboardInterrupt:
+                # lanedet: Ctrl+C saves the current position, so `--resume` continues from here
+                k = min(done_iter, nb - 2)  # never mark the epoch's batches as all done before validation ran
+                if RANK in (-1, 0) and k >= 0:
+                    self.save_checkpoint(epoch, k, last_opt_step)
+                    LOGGER.info(f'\nInterrupted. Saved {self.last} at epoch {epoch + 1}, batch {k + 1}/{nb}. '
+                                f'Resume with the same command plus --resume.')
+                raise
 
             self.lr = {f'lr/pg{ir}': x['lr'] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
@@ -486,21 +519,48 @@ class BaseTrainer:
         torch.cuda.empty_cache()
         self.run_callbacks('teardown')
 
-    def save_model(self):
-        """Save model checkpoints based on various conditions."""
-        ckpt = {
-            'epoch': self.epoch,
+    def _ckpt_dict(self, epoch, it=-1, last_opt_step=-1):
+        """lanedet: checkpoint contents. it = last finished batch of `epoch`, or -1 when the epoch is complete."""
+        return {
+            'epoch': epoch,
+            'iter': it,
             'best_fitness': self.best_fitness,
             'model': deepcopy(de_parallel(self.model)).half(),
             'ema': deepcopy(self.ema.ema).half(),
             'updates': self.ema.updates,
             'optimizer': self.optimizer.state_dict(),
+            'scaler': self.scaler.state_dict() if self.amp else None,
+            'last_opt_step': last_opt_step,
+            'subloss': [None if t is None else t.detach().cpu() for t in self.subloss] if it >= 0 else None,
             'train_args': vars(self.args),  # save as dict
             'date': datetime.now().isoformat(),
             'version': __version__}
 
+    @staticmethod
+    def _atomic_save(obj, path):
+        """lanedet: write to a temp file, then rename, so a crash mid-write never leaves a broken last.pt."""
+        tmp = Path(str(path) + '.tmp')
+        torch.save(obj, tmp)
+        for k in range(20):  # Windows refuses the rename while another program (antivirus, a reader) has it open
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.5)
+        LOGGER.warning(f'WARNING ⚠️ could not replace {path} (file in use); keeping the previous checkpoint')
+
+    def save_checkpoint(self, epoch, it, last_opt_step):
+        """lanedet: mid-epoch save of weights/last.pt (best.pt is only decided after validation)."""
+        t = time.time()
+        self._atomic_save(self._ckpt_dict(epoch, it, last_opt_step), self.last)
+        LOGGER.debug(f'Checkpoint epoch {epoch + 1} batch {it + 1} saved in {time.time() - t:.1f}s')
+
+    def save_model(self):
+        """Save model checkpoints based on various conditions."""
+        ckpt = self._ckpt_dict(self.epoch)
+
         # Save last, best and delete
-        torch.save(ckpt, self.last)
+        self._atomic_save(ckpt, self.last)
         if not self.args.val:
             return
         if self.args.task == 'multi':
@@ -691,6 +751,11 @@ class BaseTrainer:
             return
         best_fitness = 0.0
         start_epoch = ckpt['epoch'] + 1
+        it = ckpt.get('iter', -1)  # lanedet: mid-epoch checkpoint -> continue the same epoch after batch `it`
+        if self.resume and it is not None and it >= 0:
+            start_epoch = ckpt['epoch']
+            self.start_iter = it + 1
+            self.resume_state = {k: ckpt.get(k) for k in ('scaler', 'last_opt_step', 'subloss')}
         if ckpt['optimizer'] is not None:
             self.optimizer.load_state_dict(ckpt['optimizer'])  # optimizer
             best_fitness = ckpt['best_fitness']
@@ -698,11 +763,12 @@ class BaseTrainer:
             self.ema.ema.load_state_dict(ckpt['ema'].float().state_dict())  # EMA
             self.ema.updates = ckpt['updates']
         if self.resume:
-            assert start_epoch > 0, \
+            assert start_epoch > 0 or self.start_iter > 0, \
                 f'{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n' \
                 f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
             LOGGER.info(
-                f'Resuming training from {self.args.model} from epoch {start_epoch + 1} to {self.epochs} total epochs')
+                f'Resuming training from {self.args.model} from epoch {start_epoch + 1}'
+                + (f' batch {self.start_iter + 1}' if self.start_iter else '') + f' to {self.epochs} total epochs')
         if self.epochs < start_epoch:
             LOGGER.info(
                 f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs.")

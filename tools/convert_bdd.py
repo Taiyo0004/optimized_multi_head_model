@@ -7,6 +7,11 @@ Writes  <out>/images/{train,val}/*.jpg
         <out>/lanedet_data.yaml                            ready for training
         <out>/preview/*.jpg                                a few images with labels drawn, CHECK THESE
 
+Full dataset (BDD train split -> train, BDD val split -> val):
+    python tools\\convert_bdd.py --json <labels>\\bdd100k_labels_images_train.json --images <images>\\100k\\train ^
+        --val-json <labels>\\bdd100k_labels_images_val.json --val-images <images>\\100k\\val ^
+        --out datasets_local\\bdd_full --train-n 0 --val-n 0 --keep-no-lane
+
 Demo (both groups taken from BDD's val split, which A-YOLOM never saw; no overlap between them):
     python tools\\convert_bdd.py --json bdd100k\\labels\\bdd100k_labels_images_val.json ^
         --images bdd100k\\images\\val --out datasets_local\\bdd_demo --train-n 300 --val-n 100
@@ -21,6 +26,7 @@ Lanes kept: laneDirection == parallel (along the road) and laneType not crosswal
 """
 import argparse
 import json
+import os
 import random
 import shutil
 from collections import Counter
@@ -116,7 +122,11 @@ def write_sample(fr, img_src, out, split, thick, stats):
         return False
     h, w = img.shape[:2]
     stem = Path(name).stem
-    shutil.copy2(img_src, out / 'images' / split / name)
+    dst = out / 'images' / split / name
+    try:
+        os.link(img_src, dst)  # hard link: no extra disk space, instant (same drive only)
+    except OSError:
+        shutil.copy2(img_src, dst)
 
     lines = []
     for cls, x1, y1, x2, y2 in det_boxes(fr['labels']):
@@ -170,9 +180,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--json', required=True, help='bdd100k_labels_images_<split>.json')
     ap.add_argument('--images', required=True, help='folder with that split\'s images')
+    ap.add_argument('--val-json', help='separate label JSON for val (e.g. BDD val); without it val is split off --json')
+    ap.add_argument('--val-images', help='images for --val-json')
     ap.add_argument('--out', default='datasets_local/bdd_demo')
     ap.add_argument('--train-n', type=int, default=300, help='0 = all remaining images')
-    ap.add_argument('--val-n', type=int, default=100)
+    ap.add_argument('--val-n', type=int, default=100, help='0 = all images of --val-json (needs --val-json)')
+    ap.add_argument('--keep-no-lane', action='store_true',
+                    help='also keep images without any kept lane (they still teach detection and "no lane here")')
     ap.add_argument('--thick', type=int, default=8, help='lane line width in pixels at 1280x720')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
@@ -184,9 +198,10 @@ def main():
         for sub in ('images', 'detection-object/labels', 'seg-lane/labels'):
             (out / sub / split).mkdir(parents=True, exist_ok=True)
 
-    print(f'Loading {args.json} ...')
-    frames = json.load(open(args.json, encoding='utf-8'))
-    img_dir = Path(args.images)
+    if bool(args.val_json) != bool(args.val_images):
+        raise SystemExit('--val-json and --val-images go together')
+    if args.val_n == 0 and not args.val_json:
+        raise SystemExit('--val-n 0 (all) needs --val-json')
 
     def has_lane(fr, style=None):
         for lb in fr.get('labels') or []:
@@ -196,35 +211,56 @@ def main():
                 return True
         return False
 
-    # find images anywhere under --images (Kaggle downloads often add an extra folder level)
-    on_disk = {p.name: p for p in img_dir.rglob('*') if p.suffix.lower() in ('.jpg', '.jpeg', '.png')}
-    matched = [f for f in frames if f['name'] in on_disk]
-    usable = [f for f in matched if has_lane(f)]
-    print(f'{len(on_disk)} images found under {img_dir}; {len(matched)} of the {len(frames)} JSON entries match by name; '
-          f'{len(usable)} of those have at least one kept lane')
-    if not matched:
-        print('\nNO MATCHES. Example names on disk :', [p for p in list(on_disk)[:3]])
-        print('                Example names in JSON:', [f['name'] for f in frames[:3]])
-        if on_disk:
-            print('                Example image path   :', next(iter(on_disk.values())))
-        raise SystemExit('Point --images at the folder holding the photos named in the JSON.')
+    def load(json_path, images):
+        """-> (usable frames, image paths by name)"""
+        print(f'Loading {json_path} ...')
+        frames = json.load(open(json_path, encoding='utf-8'))
+        img_dir = Path(images)
+        # find images anywhere under the folder (Kaggle downloads often add an extra folder level)
+        on_disk = {p.name: p for p in img_dir.rglob('*') if p.suffix.lower() in ('.jpg', '.jpeg', '.png')}
+        matched = [f for f in frames if f['name'] in on_disk]
+        usable = matched if args.keep_no_lane else [f for f in matched if has_lane(f)]
+        print(f'{len(on_disk)} images found under {img_dir}; {len(matched)} of the {len(frames)} JSON entries match '
+              f'by name; {sum(has_lane(f) for f in matched)} of those have at least one kept lane; using {len(usable)}')
+        if not matched:
+            print('\nNO MATCHES. Example names on disk :', [p for p in list(on_disk)[:3]])
+            print('                Example names in JSON:', [f['name'] for f in frames[:3]])
+            if on_disk:
+                print('                Example image path   :', next(iter(on_disk.values())))
+            raise SystemExit('Point the images folder at the photos named in its JSON.')
+        return usable, on_disk
+
+    def ordered(frames):
+        """shuffle, with images that have both solid and dashed lanes first (best for small subsets)"""
+        both = [f for f in frames if has_lane(f, 'solid') and has_lane(f, 'dashed')]
+        both_names = {f['name'] for f in both}
+        rest = [f for f in frames if f['name'] not in both_names]
+        rng.shuffle(both)
+        rng.shuffle(rest)
+        return both + rest, len(both)
+
     rng = random.Random(args.seed)
-    both = [f for f in usable if has_lane(f, 'solid') and has_lane(f, 'dashed')]
-    both_names = {f['name'] for f in both}
-    rest = [f for f in usable if f['name'] not in both_names]
-    rng.shuffle(both)
-    rng.shuffle(rest)
-    pool = both + rest  # images with both solid and dashed lanes first
-    val = pool[:args.val_n]
-    train = pool[args.val_n:args.val_n + args.train_n] if args.train_n else pool[args.val_n:]
-    print(f'Selected train {len(train)}, val {len(val)} ({len(both)} images have both solid and dashed)')
+    usable, on_disk = load(args.json, args.images)
+    pool, n_both = ordered(usable)
+    if args.val_json:
+        vusable, von_disk = load(args.val_json, args.val_images)
+        if {f['name'] for f in vusable} & {f['name'] for f in usable}:
+            raise SystemExit('The train and val JSONs share image names - pass two different splits.')
+        vpool, _ = ordered(vusable)
+        val = vpool[:args.val_n] if args.val_n else vpool
+        train = pool[:args.train_n] if args.train_n else pool
+        on_disk = {**on_disk, **von_disk}
+    else:
+        val = pool[:args.val_n]
+        train = pool[args.val_n:args.val_n + args.train_n] if args.train_n else pool[args.val_n:]
+    print(f'Selected train {len(train)}, val {len(val)} ({n_both} train-pool images have both solid and dashed)')
 
     stats = Counter()
     for split, group in (('train', train), ('val', val)):
         ok = 0
         for i, fr in enumerate(group, 1):
             ok += write_sample(fr, on_disk[fr['name']], out, split, args.thick, stats)
-            if i % 200 == 0:
+            if i % max(200, len(group) // 20) == 0:
                 print(f'  {split}: {i}/{len(group)}')
         print(f'  {split}: wrote {ok} images')
 
